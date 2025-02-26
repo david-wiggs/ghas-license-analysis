@@ -1,0 +1,1 @@
+# ghas-license-analysis
