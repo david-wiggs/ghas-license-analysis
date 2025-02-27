@@ -91,6 +91,19 @@ class GitHubAnalyzer:
         """ % ninety_days_ago
 
         while has_next_page:
+            # Check rate limit before making the API call
+            rate_limit = self.check_rate_limit()
+            remaining = rate_limit["remaining"]
+            reset_at = rate_limit["resetAt"]
+            
+            if remaining < 1:
+                reset_time = datetime.fromisoformat(reset_at.replace('Z', '+00:00'))
+                wait_time = (reset_time - datetime.now(reset_time.tzinfo)).total_seconds()
+                
+                if wait_time > 0:
+                    print(f"\nAPI rate limit reached. Waiting {int(wait_time)} seconds until {reset_at}...")
+                    time.sleep(wait_time + 1)  # Add 1 second buffer
+            
             response = requests.post(
                 self.graphql_endpoint,
                 headers=self.headers,
@@ -145,6 +158,30 @@ class GitHubAnalyzer:
                     results[repo_key] = []
         
         return results
+
+    def check_rate_limit(self) -> Dict:
+        """Check GitHub API rate limit status"""
+        query = """
+        query {
+            rateLimit {
+                limit
+                remaining
+                resetAt
+            }
+        }
+        """
+        
+        response = requests.post(
+            self.graphql_endpoint,
+            headers=self.headers,
+            json={"query": query}
+        )
+        
+        if response.status_code != 200:
+            raise Exception("Failed to check rate limit")
+            
+        data = response.json()
+        return data["data"]["rateLimit"]
 
     def analyze_committer_coverage(self, ghas_data: Dict, repo_data: Dict[str, List[str]]) -> Dict:
         """Compare repository committers against GHAS billing data"""
