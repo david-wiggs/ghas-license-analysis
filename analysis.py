@@ -6,15 +6,21 @@ from typing import Dict, List, Set, Optional
 from pathlib import Path
 
 class GitHubAnalyzer:
-    def __init__(self, token: str, enterprise: Optional[str] = None):
+    def __init__(self, token: str, enterprise: Optional[str] = None, enterprise_server_hostname: Optional[str] = None):
         self.token = token
         self.enterprise = enterprise
+        self.enterprise_server = enterprise_server_hostname is not None
         self.headers = {
             'Authorization': f'Bearer {token}',
             'Accept': 'application/vnd.github+json',
             'X-GitHub-Api-Version': '2022-11-28'
         }
-        self.graphql_endpoint = 'https://api.github.com/graphql'
+        
+        if self.enterprise_server:
+            self.graphql_endpoint = f"https://{enterprise_server_hostname}/api/graphql"
+        else:
+            self.graphql_endpoint = 'https://api.github.com/graphql'
+        
         self.rest_endpoint = 'https://api.github.com'
 
     def get_ghas_data(self) -> Dict:
@@ -221,10 +227,13 @@ def main():
     parser.add_argument('--output', '-o',
                       default='github_analysis_report.md',
                       help='Output file path (default: github_analysis_report.md)')
+    parser.add_argument('--enterprise_server_hostname', '-H',
+                      default="api.github.com",
+                      help='GitHub API GraphQL API hostname (default: api.github.com)')
 
     args = parser.parse_args()
 
-    analyzer = GitHubAnalyzer(args.token, args.enterprise)
+    analyzer = GitHubAnalyzer(args.token, args.enterprise, args.enterprise_server_hostname)
     
     try:
         # Fetch GHAS data if enterprise is provided
