@@ -19,10 +19,10 @@ class GitHubAnalyzer:
         
         if self.enterprise_server:
             self.graphql_endpoint = f"https://{enterprise_server_hostname}/api/graphql"
+            self.rest_endpoint = f"https://{enterprise_server_hostname}/api/v3"
         else:
             self.graphql_endpoint = 'https://api.github.com/graphql'
-        
-        self.rest_endpoint = 'https://api.github.com'
+            self.rest_endpoint = 'https://api.github.com'
 
     def get_ghas_data(self) -> Dict:
         """Fetch GHAS active committers for enterprise with pagination"""
