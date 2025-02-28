@@ -228,8 +228,8 @@ def main():
                       default='github_analysis_report.md',
                       help='Output file path (default: github_analysis_report.md)')
     parser.add_argument('--enterprise_server_hostname', '-H',
-                      default="api.github.com",
-                      help='GitHub API GraphQL API hostname (default: api.github.com)')
+                      required=False,
+                      help='GitHub API GraphQL API hostname (eg: github.fabrikam.com)')
 
     args = parser.parse_args()
 
