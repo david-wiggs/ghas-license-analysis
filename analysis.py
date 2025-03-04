@@ -2,15 +2,28 @@ import argparse
 import csv
 import requests
 import time
+import traceback
+import logging
 from datetime import datetime, timedelta
 from typing import Dict, List, Set, Optional
 from pathlib import Path
 
+def setup_logging(debug=False):
+    """Configure logging with formatting and debug level option"""
+    level = logging.DEBUG if debug else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format='%(asctime)s [%(levelname)s] %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    return logging.getLogger('github_analyzer')
+
 class GitHubAnalyzer:
-    def __init__(self, token: str, enterprise: Optional[str] = None, enterprise_server_hostname: Optional[str] = None):
+    def __init__(self, token: str, enterprise: Optional[str] = None, enterprise_server_hostname: Optional[str] = None, logger=None):
         self.token = token
         self.enterprise = enterprise
         self.enterprise_server = enterprise_server_hostname is not None
+        self.logger = logger or logging.getLogger('github_analyzer')
         self.headers = {
             'Authorization': f'Bearer {token}',
             'Accept': 'application/vnd.github+json',
@@ -23,7 +36,7 @@ class GitHubAnalyzer:
         else:
             self.graphql_endpoint = 'https://api.github.com/graphql'
             self.rest_endpoint = 'https://api.github.com'
-
+    
     def get_ghas_data(self) -> Dict:
         """Fetch GHAS active committers for enterprise with pagination"""
         if not self.enterprise:
@@ -67,12 +80,81 @@ class GitHubAnalyzer:
             'repositories': all_repos
         }
 
+    def fetch_org_repos(self, org: str) -> List[Dict]:
+        """Fetch all repositories for a given organization"""
+        repos = []
+        page = 1
+        per_page = 100
+        has_more = True
+        
+        while has_more:
+            endpoint = f"{self.rest_endpoint}/orgs/{org}/repos?per_page={per_page}&page={page}"
+            
+            try:
+                response = requests.get(endpoint, headers=self.headers)
+                response.raise_for_status()
+                repo_batch = response.json()
+                
+                if not repo_batch:
+                    has_more = False
+                else:
+                    repos.extend(repo_batch)
+                    page += 1
+                    
+            except requests.exceptions.RequestException as e:
+                raise Exception(f"Failed to fetch repos for {org}: {str(e)}")
+        
+        return repos
+
+    def process_organizations(self, csv_path: str) -> Dict[str, List[str]]:
+        """Process organizations from a CSV file and analyze all their repositories"""
+        results = {}
+        
+        if not Path(csv_path).exists():
+            raise FileNotFoundError(f"CSV file not found: {csv_path}")
+        
+        with open(csv_path, 'r') as csvfile:
+            reader = csv.DictReader(csvfile)
+            if not {'org'}.issubset(set(reader.fieldnames or [])):
+                raise ValueError("CSV must contain 'org' column")
+                
+            for row in reader:
+                org = row['org']
+                try:
+                    print(f"Fetching repositories for {org}...")
+                    repos = self.fetch_org_repos(org)
+                    print(f"Found {len(repos)} repositories for {org}")
+                    
+                    # Process each repository in the organization
+                    for repo in repos:
+                        # Skip archived and forks
+                        if repo.get('archived', False) or repo.get('fork', False):
+                            continue
+                            
+                        repo_name = repo['name']
+                        repo_key = f"{org}/{repo_name}"
+                        
+                        try:
+                            print(f"Fetching committers for {repo_key}...")
+                            committers = self.fetch_repo_committers(org, repo_name)
+                            results[repo_key] = committers
+                        except Exception as e:
+                            print(f"Error processing {repo_key}: {str(e)}")
+                            results[repo_key] = []
+                            
+                except Exception as e:
+                    print(f"Error processing organization {org}: {str(e)}")
+        
+        return results
+    
     def fetch_repo_committers(self, owner: str, repo: str) -> List[str]:
         """Fetch all committers for a specific repository in the last 90 days"""
         ninety_days_ago = (datetime.now() - timedelta(days=90)).strftime("%Y-%m-%dT%H:%M:%S")
         committers: Set[str] = set()
         cursor = None
         has_next_page = True
+        
+        self.logger.debug(f"Starting to fetch committers for {owner}/{repo}")
 
         query = """
         query RecentCommitters($owner: String!, $repo: String!, $cursor: String) {
@@ -98,48 +180,93 @@ class GitHubAnalyzer:
         """ % ninety_days_ago
 
         while has_next_page:
-            # Check rate limit before making the API call
-            rate_limit = self.check_rate_limit()
-            remaining = rate_limit["remaining"]
-            reset_at = rate_limit["resetAt"]
-            
-            if remaining < 1:
-                reset_time = datetime.fromisoformat(reset_at.replace('Z', '+00:00'))
-                wait_time = (reset_time - datetime.now(reset_time.tzinfo)).total_seconds()
+            try:
+                # # Check rate limit before making the API call
+                # rate_limit = self.check_rate_limit()
+                # remaining = rate_limit["remaining"]
+                # reset_at = rate_limit["resetAt"]
+                # self.logger.debug(f"Rate limit check for {owner}/{repo}: {remaining} remaining, resets at {reset_at}")
                 
-                if wait_time > 0:
-                    print(f"\nAPI rate limit reached. Waiting {int(wait_time)} seconds until {reset_at}...")
-                    time.sleep(wait_time + 1)  # Add 1 second buffer
-            
-            response = requests.post(
-                self.graphql_endpoint,
-                headers=self.headers,
-                json={"query": query, "variables": {
-                    "owner": owner,
-                    "repo": repo,
-                    "cursor": cursor
-                }}
-            )
-            
-            if response.status_code != 200:
-                raise Exception(f"Query failed with status code: {response.status_code}")
+                # if remaining < 1:
+                #     reset_time = datetime.fromisoformat(reset_at.replace('Z', '+00:00'))
+                #     wait_time = (reset_time - datetime.now(reset_time.tzinfo)).total_seconds()
+                    
+                #     if wait_time > 0:
+                #         self.logger.info(f"API rate limit reached. Waiting {int(wait_time)} seconds until {reset_at}...")
+                #         time.sleep(wait_time + 1)  # Add 1 second buffer
+                
+                self.logger.debug(f"Sending GraphQL request for {owner}/{repo} with cursor: {cursor}")
+                response = requests.post(
+                    self.graphql_endpoint,
+                    headers=self.headers,
+                    json={"query": query, "variables": {
+                        "owner": owner,
+                        "repo": repo,
+                        "cursor": cursor
+                    }}
+                )
+                
+                if response.status_code != 200:
+                    self.logger.error(f"Query failed with status code: {response.status_code}")
+                    self.logger.debug(f"Response body: {response.text}")
+                    raise Exception(f"Query failed with status code: {response.status_code}")
 
-            data = response.json()
-            if "errors" in data:
-                raise Exception(f"GraphQL query failed: {data['errors']}")
+                data = response.json()
+                if "errors" in data:
+                    self.logger.error(f"GraphQL query failed: {data['errors']}")
+                    raise Exception(f"GraphQL query failed: {data['errors']}")
 
-            history = data["data"]["repository"]["defaultBranchRef"]["target"]["history"]
-            
-            for commit in history["nodes"]:
-                author = commit["author"]
-                if author.get("user") and author["user"].get("login"):
-                    committers.add(author["user"]["login"])
-                elif author.get("email"):
-                    committers.add(author["email"])
+                # Debug the response structure
+                self.logger.debug(f"Response structure for {owner}/{repo}: {list(data.keys())}")
+                if 'data' in data:
+                    self.logger.debug(f"Data structure: {list(data['data'].keys())}")
+                    if 'repository' in data['data']:
+                        repo_data = data['data']['repository']
+                        self.logger.debug(f"Repository structure: {list(repo_data.keys())}")
+                        if 'defaultBranchRef' in repo_data:
+                            self.logger.debug(f"DefaultBranchRef present: {repo_data['defaultBranchRef'] is not None}")
+                            if repo_data['defaultBranchRef']:
+                                self.logger.debug(f"Target present: {repo_data['defaultBranchRef'].get('target') is not None}")
 
-            has_next_page = history["pageInfo"]["hasNextPage"]
-            cursor = history["pageInfo"]["endCursor"]
+                # Using get() for all nested accesses with detailed logging
+                repository = data.get("data", {}).get("repository", {})
+                self.logger.debug(f"Repository data: {bool(repository)}")
+                
+                default_branch_ref = repository.get("defaultBranchRef", {})
+                self.logger.debug(f"Default branch ref: {bool(default_branch_ref)}")
+                
+                target = default_branch_ref.get("target", {})
+                self.logger.debug(f"Target: {bool(target)}")
+                
+                history = target.get("history")
+                self.logger.debug(f"History: {bool(history)}")
 
+                if not history:
+                    self.logger.info(f"Repository {owner}/{repo} has no commit history or is empty.")
+                    return []
+
+                # Use the safely accessed history object, not the direct path
+                page_info = history.get("pageInfo", {})
+                nodes = history.get("nodes", [])
+                self.logger.debug(f"Found {len(nodes)} commits in this batch")
+                
+                for commit in nodes:
+                    author = commit.get("author", {})
+                    if author.get("user") and author["user"].get("login"):
+                        committers.add(author["user"]["login"])
+                    elif author.get("email"):
+                        committers.add(author["email"])
+
+                has_next_page = page_info.get("hasNextPage", False)
+                cursor = page_info.get("endCursor")
+                self.logger.debug(f"Pagination: has_next_page={has_next_page}, cursor={cursor}")
+                
+            except Exception as e:
+                self.logger.error(f"Error in fetch_repo_committers for {owner}/{repo}: {str(e)}")
+                self.logger.debug(f"Detailed error: {traceback.format_exc()}")
+                raise
+        
+        self.logger.info(f"Found {len(committers)} committers for {owner}/{repo}")
         return sorted(list(committers))
 
     def process_repositories(self, csv_path: str) -> Dict[str, List[str]]:
@@ -223,18 +350,32 @@ def main():
                       required=False,
                       help='GitHub Enterprise name (required for GHAS analysis)')
     parser.add_argument('--csv', '-c',
-                      required=True,
-                      help='Path to CSV file containing repositories (format: owner,repo)')
+                      required=False,
+                      help='Path to CSV file containing organizations (format: org)')
+    parser.add_argument('--orgs', '-g',
+                      required=False,
+                      nargs='+',
+                      help='List of organizations to analyze (space-separated)')
     parser.add_argument('--output', '-o',
                       default='github_analysis_report.md',
                       help='Output file path (default: github_analysis_report.md)')
     parser.add_argument('--enterprise_server_hostname', '-H',
                       required=False,
-                      help='GitHub API GraphQL API hostname (eg: github.fabrikam.com)')
-
+                      help='GitHub Enterprise Server hostname (eg: github.fabrikam.com)')
+    parser.add_argument('--debug', '-d',
+                      action='store_true',
+                      help='Enable debug logging')
+                      
     args = parser.parse_args()
+    
+    # Setup logging
+    logger = setup_logging(args.debug)
+    
+    # Validate that either CSV or organizations are provided
+    if not args.csv and not args.orgs:
+        parser.error("Either --csv or --orgs must be specified")
 
-    analyzer = GitHubAnalyzer(args.token, args.enterprise, args.enterprise_server_hostname)
+    analyzer = GitHubAnalyzer(args.token, args.enterprise, args.enterprise_server_hostname, logger)
     
     try:
         # Fetch GHAS data if enterprise is provided
@@ -243,9 +384,41 @@ def main():
             print("Fetching GHAS data...")
             ghas_data = analyzer.get_ghas_data()
 
-        # Process repositories from CSV
-        print("Processing repositories...")
-        repo_data = analyzer.process_repositories(args.csv)
+        # Process organizations
+        print("Processing organizations...")
+        repo_data = {}
+        
+        # If orgs are provided directly on command line
+        if args.orgs:
+            for org in args.orgs:
+                try:
+                    print(f"Fetching repositories for {org}...")
+                    repos = analyzer.fetch_org_repos(org)
+                    print(f"Found {len(repos)} repositories for {org}")
+                    
+                    # Process each repository in the organization
+                    for repo in repos:
+                        # Skip archived and forks
+                        if repo.get('archived', False) or repo.get('fork', False):
+                            continue
+                            
+                        repo_name = repo['name']
+                        repo_key = f"{org}/{repo_name}"
+                        
+                        try:
+                            print(f"Fetching committers for {repo_key}...")
+                            committers = analyzer.fetch_repo_committers(org, repo_name)
+                            repo_data[repo_key] = committers
+                        except Exception as e:
+                            print(f"Error processing {repo_key}: {str(e)}")
+                            repo_data[repo_key] = []
+                            
+                except Exception as e:
+                    print(f"Error processing organization {org}: {str(e)}")
+        
+        # Process organizations from CSV if provided
+        elif args.csv:
+            repo_data = analyzer.process_organizations(args.csv)
 
         # Generate report
         with open(args.output, 'w') as f:
