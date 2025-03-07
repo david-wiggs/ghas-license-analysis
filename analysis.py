@@ -150,7 +150,7 @@ class GitHubAnalyzer:
     def fetch_repo_committers(self, owner: str, repo: str) -> List[str]:
         """Fetch all committers for a specific repository in the last 90 days"""
         ninety_days_ago = (datetime.now() - timedelta(days=90)).strftime("%Y-%m-%dT%H:%M:%S")
-        committers: Set[str] = set()
+        committers = {}
         cursor = None
         has_next_page = True
         
@@ -179,21 +179,40 @@ class GitHubAnalyzer:
         }
         """ % ninety_days_ago
 
+        remaining_rate_limit = 5000  # Default to GitHub's standard rate limit
+        rate_limit_reset = None
+
         while has_next_page:
             try:
-                # # Check rate limit before making the API call
-                # rate_limit = self.check_rate_limit()
-                # remaining = rate_limit["remaining"]
-                # reset_at = rate_limit["resetAt"]
-                # self.logger.debug(f"Rate limit check for {owner}/{repo}: {remaining} remaining, resets at {reset_at}")
-                
-                # if remaining < 1:
-                #     reset_time = datetime.fromisoformat(reset_at.replace('Z', '+00:00'))
-                #     wait_time = (reset_time - datetime.now(reset_time.tzinfo)).total_seconds()
+                # Check if we need to wait for rate limit reset
+                if remaining_rate_limit < 1 and rate_limit_reset:
+                    reset_time = datetime.fromisoformat(rate_limit_reset.replace('Z', '+00:00'))
+                    wait_time = (reset_time - datetime.now(reset_time.tzinfo)).total_seconds()
                     
-                #     if wait_time > 0:
-                #         self.logger.info(f"API rate limit reached. Waiting {int(wait_time)} seconds until {reset_at}...")
-                #         time.sleep(wait_time + 1)  # Add 1 second buffer
+                    if wait_time > 0:
+                        self.logger.info(f"API rate limit reached. Waiting {int(wait_time)} seconds until {rate_limit_reset}...")
+                        time.sleep(wait_time + 1)  # Add 1 second buffer
+                
+                self.logger.debug(f"Sending GraphQL request for {owner}/{repo} with cursor: {cursor}")
+                response = requests.post(
+                    self.graphql_endpoint,
+                    headers=self.headers,
+                    json={"query": query, "variables": {
+                        "owner": owner,
+                        "repo": repo,
+                        "cursor": cursor
+                    }}
+                )
+                
+                # Extract rate limit information from headers
+                if 'x-ratelimit-remaining' in response.headers:
+                    remaining_rate_limit = int(response.headers['x-ratelimit-remaining'])
+                    self.logger.debug(f"Rate limit remaining: {remaining_rate_limit}")
+                    
+                if 'x-ratelimit-reset' in response.headers:
+                    reset_timestamp = int(response.headers['x-ratelimit-reset'])
+                    rate_limit_reset = datetime.fromtimestamp(reset_timestamp).isoformat()
+                    self.logger.debug(f"Rate limit resets at: {rate_limit_reset}")
                 
                 self.logger.debug(f"Sending GraphQL request for {owner}/{repo} with cursor: {cursor}")
                 response = requests.post(
@@ -252,14 +271,17 @@ class GitHubAnalyzer:
                 
                 for commit in nodes:
                     author = commit.get("author", {})
-                    if author.get("user") and author["user"].get("login"):
-                        committers.add(author["user"]["login"])
-                    elif author.get("email"):
-                        committers.add(author["email"])
-
+                    user = author.get("user", {})
+                    username = user.get("login") if user else author.get("name")
+                    email = author.get("email", "")
+                    
+                    # Use username as key if available, otherwise use email
+                    key = username or email
+                    if key:
+                        committers[key] = {"username": username or "", "email": email}
+                
                 has_next_page = page_info.get("hasNextPage", False)
                 cursor = page_info.get("endCursor")
-                self.logger.debug(f"Pagination: has_next_page={has_next_page}, cursor={cursor}")
                 
             except Exception as e:
                 self.logger.error(f"Error in fetch_repo_committers for {owner}/{repo}: {str(e)}")
@@ -267,7 +289,7 @@ class GitHubAnalyzer:
                 raise
         
         self.logger.info(f"Found {len(committers)} committers for {owner}/{repo}")
-        return sorted(list(committers))
+        return list(committers.values())
 
     def process_repositories(self, csv_path: str) -> Dict[str, List[str]]:
         """Process multiple repositories from a CSV file"""
@@ -293,53 +315,108 @@ class GitHubAnalyzer:
         
         return results
 
-    def check_rate_limit(self) -> Dict:
-        """Check GitHub API rate limit status"""
-        query = """
-        query {
-            rateLimit {
-                limit
-                remaining
-                resetAt
-            }
-        }
-        """
-        
-        response = requests.post(
-            self.graphql_endpoint,
-            headers=self.headers,
-            json={"query": query}
-        )
-        
-        if response.status_code != 200:
-            raise Exception("Failed to check rate limit")
-            
-        data = response.json()
-        return data["data"]["rateLimit"]
-
-    def analyze_committer_coverage(self, ghas_data: Dict, repo_data: Dict[str, List[str]]) -> Dict:
+    def analyze_committer_coverage(self, ghas_data: Dict, repo_data: Dict[str, List[Dict[str, str]]]) -> Dict:
         """Compare repository committers against GHAS billing data"""
-        all_repo_committers = set()
-        for committers in repo_data.values():
-            all_repo_committers.update(committers)
+        # Collect all unique committers from repos
+        all_repo_committers = {}  # Use username as key
         
-        ghas_committers = set()
+        for repo_committers in repo_data.values():
+            for committer in repo_committers:
+                username = committer.get("username")
+                email = committer.get("email")
+                key = username or email
+                if key:
+                    all_repo_committers[key] = committer
+        
+        # Collect GHAS committers
+        ghas_committer_usernames = set()
+        ghas_committer_objects = []
+        
         for repo in ghas_data.get('repositories', []):
             if repo.get('advanced_security_committers', 0) > 0:
-                # Extract user_login from the breakdown
                 for committer in repo.get('advanced_security_committers_breakdown', []):
-                    if committer.get('user_login'):
-                        ghas_committers.add(committer['user_login'])
+                    username = committer.get('user_login')
+                    email = committer.get('email', '')
+                    if username:
+                        ghas_committer_usernames.add(username)
+                        ghas_committer_objects.append({
+                            "username": username,
+                            "email": email
+                        })
         
-        new_committers = all_repo_committers - ghas_committers
+        # Find committers not covered by GHAS
+        new_committer_keys = set(all_repo_committers.keys()) - ghas_committer_usernames
+        new_committer_objects = [all_repo_committers[key] for key in new_committer_keys]
         
         return {
             'total_repo_committers': len(all_repo_committers),
-            'total_ghas_committers': len(ghas_committers),
-            'ghas_committers': sorted(list(ghas_committers)),  # List of user_logins
-            'new_committers': sorted(list(new_committers)),
-            'new_committer_count': len(new_committers)
+            'total_ghas_committers': len(ghas_committer_objects),
+            'ghas_committers': ghas_committer_objects,
+            'new_committers': new_committer_objects,
+            'new_committer_count': len(new_committer_objects)
         }
+
+    def generate_csv_reports(self, output_prefix: str, comparison: Dict, repo_data: Dict[str, List[Dict[str, str]]]):
+        """Generate CSV reports for committers and repositories in a dedicated folder"""
+        
+        # Create output directory based on output prefix
+        output_dir = f"{output_prefix}_reports"
+        os.makedirs(output_dir, exist_ok=True)
+        self.logger.info(f"Created output directory: {output_dir}")
+        
+        # 1. Create CSV for GHAS licensed committers
+        ghas_csv_path = os.path.join(output_dir, "ghas_committers.csv")
+        with open(ghas_csv_path, 'w', newline='') as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(['Username', 'Email'])
+            
+            for committer in comparison['ghas_committers']:
+                username = committer.get("username", "")
+                email = committer.get("email", "")
+                writer.writerow([username, email])
+        
+        self.logger.info(f"Generated GHAS committers CSV report: {ghas_csv_path}")
+        
+        # 2. Create CSV for new committers that need GHAS licenses
+        new_csv_path = os.path.join(output_dir, "new_committers.csv")
+        with open(new_csv_path, 'w', newline='') as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(['Username', 'Email'])
+            
+            for committer in comparison['new_committers']:
+                username = committer.get("username", "")
+                email = committer.get("email", "")
+                writer.writerow([username, email])
+        
+        self.logger.info(f"Generated new committers CSV report: {new_csv_path}")
+        
+        # 3. Create CSV for repository committer analysis
+        repo_csv_path = os.path.join(output_dir, "repository_analysis.csv")
+        with open(repo_csv_path, 'w', newline='') as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(['Repository', 'Username', 'Email'])
+            
+            for repo, committers in repo_data.items():
+                for committer in committers:
+                    username = committer.get("username", "")
+                    email = committer.get("email", "")
+                    writer.writerow([repo, username, email])
+        
+        self.logger.info(f"Generated repository committer analysis CSV report: {repo_csv_path}")
+        
+        # 4. Create a summary CSV with repository counts
+        summary_csv_path = os.path.join(output_dir, "repo_summary.csv")
+        with open(summary_csv_path, 'w', newline='') as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(['Repository', 'Committer Count'])
+            
+            for repo, committers in repo_data.items():
+                writer.writerow([repo, len(committers)])
+        
+        self.logger.info(f"Generated repository summary CSV report: {summary_csv_path}")
+        
+        # Return the output directory path
+        return output_dir
 
 def main():
     parser = argparse.ArgumentParser(description='Analyze GitHub Advanced Security committers')
@@ -420,8 +497,16 @@ def main():
         elif args.csv:
             repo_data = analyzer.process_organizations(args.csv)
 
-        # Generate report
-        with open(args.output, 'w') as f:
+        # Generate reports
+        # Generate markdown report
+        output_prefix = os.path.splitext(args.output)[0]
+        output_dir = f"{output_prefix}_reports"
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Place the markdown report in the same folder
+        report_path = os.path.join(output_dir, os.path.basename(args.output))
+        with open(report_path, 'w') as f:
+            # Generate markdown report
             f.write("# GitHub Analysis Report\n\n")
             
             if ghas_data:
@@ -441,28 +526,51 @@ def main():
                 if comparison['new_committers']:
                     f.write("### Committers Not Covered by GHAS\n")
                     for committer in comparison['new_committers']:
-                        f.write(f"- {committer}\n")
+                        username = committer.get("username")
+                        email = committer.get("email")
+                        if username and email:
+                            f.write(f"- {username} ({email})\n")
+                        elif username:
+                            f.write(f"- {username}\n")
+                        elif email:
+                            f.write(f"- {email}\n")
                     f.write("\n")
 
                 f.write("<details>\n")
                 f.write("<summary>Existing Committers with GHAS License</summary>\n\n")
                 for committer in comparison['ghas_committers']:
-                    f.write(f"- {committer}\n")
+                    username = committer.get("username")
+                    email = committer.get("email")
+                    if username and email:
+                        f.write(f"- {username} ({email})\n")
+                    elif username:
+                        f.write(f"- {username}\n")
+                    elif email:
+                        f.write(f"- {email}\n")
                 f.write("</details>\n\n")
             
             f.write("<details>\n")
             f.write("<summary>Repository Committer Analysis</summary>\n\n")
-            
             for repo, committers in repo_data.items():
                 f.write("<details>\n")
                 f.write(f"<summary> {repo} (Active committers: {len(committers)})</summary>\n\n")
                 for committer in committers:
-                    f.write(f"- {committer}\n")
+                    username = committer.get("username")
+                    email = committer.get("email")
+                    if username and email:
+                        f.write(f"- {username} ({email})\n")
+                    elif username:
+                        f.write(f"- {username}\n")
+                    elif email:
+                        f.write(f"- {email}\n")
                 f.write("</details>\n\n")
-            
             f.write("</details>\n\n")
 
         print(f"\nReport generated: {args.output}")
+
+        # Generate CSV reports
+        analyzer.generate_csv_reports(output_prefix, comparison, repo_data)
+        print(f"\nAnalysis complete! Reports generated in folder: {output_dir}")
 
     except Exception as e:
         print(f"Error: {str(e)}")
